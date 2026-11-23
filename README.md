@@ -12,6 +12,39 @@
 - **回退控制器**：保留旧规则只读快照，撤回指定范围内的新输出；
 - **事件证据账**：每次风险结论记录输入、规则与状态版本，区分 `OLD_OUTPUT` / `NEW_CANDIDATE` / `NEW_OUTPUT` / `RETRACTED`。
 
+## 降雨事件重建与流域雨量贡献数据集
+
+降雨记录若简单按每次强度过阈切场，会把同一场持续风暴拆成多个独立入流；按整夜合并又会把两场雨及其不同河道响应混在一起。本数据集以**事件**为单位重建降雨，并提供流域雨量贡献过程：
+
+- **事件求值器**：把站点采样按**校时误差**对齐到标准 10 分钟时段（`correctedAt = observedAt − clockOffsetSec`），重建降雨事件，输出开始/结束、累计量上下界与空间覆盖；
+- **流域映射器**：依据站点→子流域权重（版本化权重集）生成各子流域 10 分钟分区降雨过程，并按子流域面积折算流域面雨量；
+- **事件版本账**：站点增补、设备更换、权重变动三类变更落账，按原重建参数重算两方案，保留对已计算风险窗口的影响前后对照；
+- **缺测界限器**：缺测时段只给累计雨量上下界（下界=实测累计，上界=实测+缺测段×单时段上界估计），**不用插值点伪装实测**。
+
+### 事件边界两方案
+
+| 方案 | 规则 | 优点 | 代价 |
+| --- | --- | --- |
+| `FIXED_GAP` | 连续无雨 ≥ 固定间隔（默认 30min）即拆场 | 规则透明、可复算 | 土壤已饱和时可能把对产流重要的间歇误判为新场 |
+| `ADAPTIVE_WETNESS` | 前期累计面雨量 ≥ 湿润阈值（默认 12mm，视为土壤饱和）时，间歇须 ≥ 流域响应时间（默认 45min）才拆场 | 更贴近产流物理 | 需校准湿润阈值与响应时间 |
+
+**缺测不按无雨处理**：某时段只要有加权站缺测且无实测降雨，该时段状态为 UNKNOWN。缺测段恰好落在候选无雨间隔内时，事件边界不可判——求值器枚举“缺测段有雨/无雨”两种假设分别划场，输出**候选区间**（`status=CANDIDATE`，按 `candidateSetNo` 分组），**不强行定场**；若各假设划场相同（如湿润方案中间歇必被合并），则定为 `CONFIRMED`。
+
+### 跨日样例（演示数据）
+
+2026-08-14 23:00 → 2026-08-15 02:00（UTC）两站 10 分钟雨量：
+
+- `ST-A`（站钟快 30s）：23:50–00:20 有 30 分钟无雨间隔，00:20 短暂降雨，00:40 起再降雨；
+- `ST-B`（站钟慢 40s）：同段 3 个时段**缺测**；
+- 权重集 `WS-1`：SB-1（城东 5.2km²）A0.7/B0.3，SB-2（城西 3.8km²）A0.2/B0.8。
+
+核对结论（`scripts/smoke-rainfall.sh` 逐步断言）：
+
+1. **事件是否跨日**：`FIXED_GAP` 候选集 1 两场均不跨日（23:00–23:50、00:20–01:20），候选集 2 单场跨日；`ADAPTIVE_WETNESS` 因前期面雨量 15.4mm ≥ 12mm 且间歇 30min < 响应 45min，定为**单场跨日事件**（窗口末端确认无雨 40min < 45min，`openEnded=true`）；
+2. **流域累计范围**：合并事件累计 **[24.369, 29.276]mm**（ST-B 缺测 3 段，上界 = 实测 20.8 + 3×事件内最大实测 3.2 = 30.4mm，不加插值）；空间覆盖 0.89；
+3. **风险归因差异**：`FIXED_GAP` 候选集 1 把夜间归因于两场独立入流（15.4mm/MEDIUM + 8.9mm/LOW），`ADAPTIVE_WETNESS` 归因于单场跨日事件（MEDIUM..HIGH，上下界跨档两级并存）；
+4. **版本账**：增补 ST-C（证实间歇期有雨）→ 候选区间消解为 CONFIRMED 单场跨日事件；ST-B 设备更换（校时误差 −40s→−5s）→ 采样重对齐、过程线前移；权重变动 → WS-3 重算累计与风险分档。
+
 ## 技术栈
 
 Java 25 · Spring Boot 4.0 · Spring Data JPA · PostgreSQL 18 · springdoc-openapi（Swagger UI）· Maven
@@ -63,6 +96,13 @@ Swagger UI（`/swagger-ui.html`）与 OpenAPI 文档（`/v3/api-docs`）无需�
 | 切换闸门 | `POST /api/streams/{id}/gate/evaluate`、`POST .../gate/release`、`GET .../gate` | 评估/发布/状态 |
 | 回退控制 | `POST /api/streams/{id}/rollbacks`、`GET .../rollbacks` | 撤回输出范围、旧快照只读 |
 | 证据账 | `GET /api/streams/{id}/evidence?partitionNo=&kind=` | 按分区/类别查询证据 |
+| 雨量站点 | `POST /api/rain/stations`、`GET /api/rain/stations[/{id}]` | 登记/查询雨量站（校时误差、设备编号） |
+| 雨量采样 | `POST /api/rain/stations/{id}/samples`、`GET .../samples?from=&to=` | 批量写入 10 分钟采样（按校时误差对齐，同时段重写视为订正）与查询 |
+| 权重集 | `POST /api/rain/weight-sets`、`GET /api/rain/weight-sets` | 登记首个站点→子流域权重集（后续变动走版本账） |
+| 事件重建 | `POST /api/rain/events/reconstruct`、`GET /api/rain/events[/{id}]` | 两方案重建（起止/累计上下界/空间覆盖/候选区间）与查询 |
+| 方案对比 | `GET /api/rain/events/compare?from=&to=` | 候选集、风险窗口与风险归因差异 |
+| 子流域过程 | `GET /api/rain/subbasins/{code}/series?from=&to=&scheme=` | 分区 10 分钟雨量上下界与实测覆盖率 |
+| 事件版本账 | `POST /api/rain/ledger/changes`、`GET /api/rain/ledger?changeType=` | 站点增补/设备更换/权重变动落账并重算，查询对已算风险窗口的影响 |
 
 ## 迁移路线选择语义
 
@@ -80,6 +120,14 @@ Swagger UI（`/swagger-ui.html`）与 OpenAPI 文档（`/v3/api-docs`）无需�
 3. 回放分区越过切换水印时，证据账区分：已发布新输出（越水印部分**撤回**为 `RETRACTED`）、本次回放结果仅作**新候选**（`NEW_CANDIDATE`）、旧输出（`OLD_OUTPUT`）保持不变。
 4. 回退保留旧规则**只读快照**，撤回 `[fromOffset, toOffset]` 范围内的新输出，闸门回到 `HOLD`，流恢复旧规则服务。
 
+## 降雨数据集关键规则
+
+1. **校时对齐**：采样落库即按站点当前校时误差校正（`correctedAt = observedAt − clockOffsetSec`）并归入标准 10 分钟时段；设备更换只重对齐生效时刻之后观测的采样，历史校正值落库可审计。
+2. **缺测不伪装**：`MISSING` 采样不落数值；事件累计下界只计实测，上界按“事件内最大实测→窗口最大实测→同时段跨站最大→配置上限（默认 10mm/10min）”估计，估计值仅用于上界，绝不写作实测。
+3. **缺测不定场**：缺测段落在候选无雨间隔内时边界不可判，输出候选区间（`CANDIDATE` + `candidateSetNo`），待数据补齐或站点增补后自然消解；不强行定场。
+4. **版本账可追溯**：站点增补/设备更换/权重变动触发两方案按原参数重算，旧事件与风险窗口置 `SUPERSEDED`（记录 `supersededByRunNo`），账内保存风险窗口前后对照。
+5. **风险窗口分档**：流域面雨量累计按 `riskMediumMm`（默认 15mm）/`riskHighMm`（默认 25mm）定级，上下界分别定级，跨档时两级并存（如 MEDIUM..HIGH）。
+
 ## 演示数据（首次启动自动写入）
 
 流 `FY-MAIN`（4 个分区，p0/p1/p2 为关键分区）：
@@ -94,14 +142,19 @@ Swagger UI（`/swagger-ui.html`）与 OpenAPI 文档（`/v3/api-docs`）无需�
 ## 验证方式（本仓库交付前实际执行过的验证）
 
 ```bash
-# 1) 自动化测试：17 个用例全部通过（证明器/计划器/适配器回退/双轨/闸门/规则修订/回退/证据账/接口鉴权）
+# 1) 自动化测试：30 个用例全部通过（证明器/计划器/双轨/闸门/规则修订/回退/证据账/接口鉴权
+#    + 降雨重建两方案/跨日/候选区间/缺测上下界/流域映射/版本账三类变更）
 mvn test
 
-# 2) 端到端冒烟（应用已启动、演示数据为初始状态）：12 步完整升级流程，输出 SMOKE_OK
+# 2) 迁移流程端到端冒烟（应用已启动、演示数据为初始状态）：12 步完整升级流程，输出 SMOKE_OK
 scripts/smoke.sh
 
-# 3) 重复冒烟前先重置演示数据（清空业务表并重启应用重新播种）
-scripts/reset-db.sh && scripts/smoke.sh
+# 3) 降雨数据集端到端冒烟：校时对齐 → 两方案重建 → 候选区间/跨日/累计范围核对 →
+#    风险归因差异 → 子流域过程 → 版本账三类变更，输出 RAIN_SMOKE_OK
+scripts/smoke-rainfall.sh
+
+# 4) 重复冒烟前先重置演示数据（清空业务表并重启应用重新播种）
+scripts/reset-db.sh && scripts/smoke.sh && scripts/smoke-rainfall.sh
 ```
 
 冒烟流程：证明 → 迁移编排（p0/p3 适配、p1/p2 回放）→ 执行 → 双轨（p2 低→高升级）→ 闸门待验证 →
@@ -116,13 +169,15 @@ p1 回放越过切换水印（已发布输出撤回、结果仅作候选）→ �
 
 ```
 src/main/java/com/flood/statemigrate/
-├── domain/      # 实体与枚举（流定义/规则包/检查点/证明/计划/双轨/闸门/回退/证据/事件）
+├── domain/      # 实体与枚举（流定义/规则包/检查点/证明/计划/双轨/闸门/回退/证据/事件
+│                #   + 雨量站/采样/降雨事件/风险窗口/子流域过程/权重集/版本账）
 ├── repo/        # Spring Data JPA 仓库
 ├── service/     # 证明器、计划器（适配+回放）、双轨、闸门、回退、证据账、聚合与规则引擎
+│                #   + 事件求值器、缺测界限器、流域映射器、事件版本账、降雨查询
 ├── web/         # REST 控制器与请求 DTO
 ├── config/      # 安全、OpenAPI、演示数据种子
 └── error/       # 统一异常处理
-scripts/         # smoke.sh 端到端冒烟、reset-db.sh 演示数据重置
+scripts/         # smoke.sh 迁移冒烟、smoke-rainfall.sh 降雨冒烟、reset-db.sh 演示数据重置
 docker/          # Maven 镜像仓库配置（构建加速）
 Dockerfile · docker-compose.yml
 ```

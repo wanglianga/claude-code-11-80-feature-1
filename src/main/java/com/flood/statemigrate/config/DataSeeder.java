@@ -2,6 +2,7 @@ package com.flood.statemigrate.config;
 
 import com.flood.statemigrate.domain.*;
 import com.flood.statemigrate.repo.*;
+import com.flood.statemigrate.service.RainStationService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -19,6 +20,7 @@ import java.util.List;
  * 演示数据：流 FY-MAIN 四个分区。
  *  p0 检查点完成且启停守恒 → 适配；p1 快照缺失启停事件 → 限定窗口回放；
  *  p2 旧作业检查点未完成且新规则低→高 → 闸门待验证；p3 守恒满足（空启停）→ 适配。
+ * 另含降雨事件重建演示：两站 10 分钟雨量跨日样例（见 seedRainfall）。
  */
 @Component
 public class DataSeeder implements ApplicationRunner {
@@ -30,26 +32,45 @@ public class DataSeeder implements ApplicationRunner {
     private final CheckpointManifestRepo checkpointRepo;
     private final StreamEventRepo eventRepo;
     private final EvidenceEntryRepo evidenceRepo;
+    private final RainStationRepo rainStationRepo;
+    private final RainSampleRepo rainSampleRepo;
+    private final WeightSetRepo weightSetRepo;
+    private final RainStationService rainStationService;
     private final boolean seedEnabled;
 
     public DataSeeder(StreamDefinitionRepo streamRepo, RulePackageRepo rulePackageRepo,
                       CheckpointManifestRepo checkpointRepo, StreamEventRepo eventRepo,
                       EvidenceEntryRepo evidenceRepo,
+                      RainStationRepo rainStationRepo, RainSampleRepo rainSampleRepo,
+                      WeightSetRepo weightSetRepo, RainStationService rainStationService,
                       @Value("${app.seed-demo-data:true}") boolean seedEnabled) {
         this.streamRepo = streamRepo;
         this.rulePackageRepo = rulePackageRepo;
         this.checkpointRepo = checkpointRepo;
         this.eventRepo = eventRepo;
         this.evidenceRepo = evidenceRepo;
+        this.rainStationRepo = rainStationRepo;
+        this.rainSampleRepo = rainSampleRepo;
+        this.weightSetRepo = weightSetRepo;
+        this.rainStationService = rainStationService;
         this.seedEnabled = seedEnabled;
     }
 
     @Override
     @Transactional
     public void run(ApplicationArguments args) {
-        if (!seedEnabled || streamRepo.count() > 0) {
+        if (!seedEnabled) {
             return;
         }
+        if (streamRepo.count() == 0) {
+            seedMigrationDemo();
+        }
+        if (rainStationRepo.count() == 0) {
+            seedRainfall();
+        }
+    }
+
+    private void seedMigrationDemo() {
         log.info("写入演示数据: FY-MAIN");
         Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
 
@@ -223,5 +244,57 @@ public class DataSeeder implements ApplicationRunner {
         e.setWatermarkOffset(offset);
         e.setNote("旧作业已发布输出");
         evidenceRepo.save(e);
+    }
+
+    /**
+     * 降雨事件重建演示：2026-08-14 23:00 → 2026-08-15 02:00（UTC）两站 10 分钟雨量。
+     *  ST-A（城东，站钟快 30s）：23:50–00:20 有 30 分钟无雨间隔，00:20 短暂降雨，00:40 起再降雨；
+     *  ST-B（城西，站钟慢 40s）：同段（23:50/00:00/00:10 三个时段）缺测。
+     * 固定间隔方案（30 分钟）在缺口处达到拆场阈值，但 B 站缺测使边界不可判 → 保留候选区间；
+     * 湿润状态方案因前期面雨量 15.4mm ≥ 12mm（土壤饱和）且间歇 30min &lt; 流域响应 45min → 合并为单场跨日事件。
+     * 权重集 WS-1：SB-1（城东 5.2km²）A0.7/B0.3，SB-2（城西 3.8km²）A0.2/B0.8。
+     */
+    private void seedRainfall() {
+        log.info("写入降雨演示数据: ST-A/ST-B 跨日样例");
+        RainStation a = new RainStation();
+        a.setStationCode("ST-A");
+        a.setName("城东雨量站");
+        a.setClockOffsetSec(30);
+        a.setEquipmentId("EQ-A-1");
+        a.setActive(true);
+        rainStationRepo.save(a);
+
+        RainStation b = new RainStation();
+        b.setStationCode("ST-B");
+        b.setName("城西雨量站");
+        b.setClockOffsetSec(-40);
+        b.setEquipmentId("EQ-B-1");
+        b.setActive(true);
+        rainStationRepo.save(b);
+
+        WeightSet ws = new WeightSet();
+        ws.setVersion("WS-1");
+        ws.setWeightsJson("["
+                + "{\"stationCode\":\"ST-A\",\"subbasinCode\":\"SB-1\",\"weight\":0.7},"
+                + "{\"stationCode\":\"ST-B\",\"subbasinCode\":\"SB-1\",\"weight\":0.3},"
+                + "{\"stationCode\":\"ST-A\",\"subbasinCode\":\"SB-2\",\"weight\":0.2},"
+                + "{\"stationCode\":\"ST-B\",\"subbasinCode\":\"SB-2\",\"weight\":0.8}]");
+        ws.setAreasJson("{\"SB-1\":5.2,\"SB-2\":3.8}");
+        ws.setStatus("ACTIVE");
+        weightSetRepo.save(ws);
+
+        Instant base = Instant.parse("2026-08-14T23:00:00Z");
+        Double[] mmA = {3.0, 3.4, 3.8, 4.2, 3.6, 0.0, 0.0, 0.0, 1.8, 0.0,
+                2.2, 2.6, 2.0, 1.5, 0.0, 0.0, 0.0, 0.0};
+        Double[] mmB = {2.4, 2.8, 3.2, 2.6, 2.0, null, null, null, 1.2, 0.0,
+                1.8, 2.1, 1.6, 1.1, 0.0, 0.0, 0.0, 0.0};
+        for (int i = 0; i < mmA.length; i++) {
+            Instant bucket = base.plus(10L * i, ChronoUnit.MINUTES);
+            // ST-A 站钟快 30s：观测时间戳 = 真值 + 30s；ST-B 站钟慢 40s：观测时间戳 = 真值 - 40s
+            rainStationService.addSample(a, bucket.plusSeconds(30), mmA[i], SampleQuality.MEASURED);
+            rainStationService.addSample(b, bucket.minusSeconds(40),
+                    mmB[i], mmB[i] == null ? SampleQuality.MISSING : SampleQuality.MEASURED);
+        }
+        log.info("降雨演示数据就绪: 两站各 {} 个时段（ST-B 缺测 3 段）", mmA.length);
     }
 }

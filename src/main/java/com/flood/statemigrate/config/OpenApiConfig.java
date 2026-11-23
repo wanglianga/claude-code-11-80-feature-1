@@ -18,7 +18,8 @@ public class OpenApiConfig {
                         .title("防汛平台状态迁移与规则升级服务")
                         .version("1.0.0")
                         .description("流定义登记、检查点比对、状态语义证明、迁移编排（适配/回放/人工）、"
-                                + "双轨校验、切换闸门、回退控制与事件证据账。")
+                                + "双轨校验、切换闸门、回退控制与事件证据账；"
+                                + "降雨事件重建与流域雨量贡献数据集（事件求值器/流域映射器/事件版本账/缺测界限器）。")
                         .contact(new Contact().name("flood-ops")))
                 .addSecurityItem(new SecurityRequirement().addList("basicAuth"))
                 .schemaRequirement("basicAuth", new SecurityScheme()

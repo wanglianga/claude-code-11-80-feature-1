@@ -21,11 +21,25 @@ abstract class BaseIntegrationTest {
     @Autowired protected SwitchGateRepo gateRepo;
     @Autowired protected RollbackRecordRepo rollbackRepo;
     @Autowired protected EvidenceEntryRepo evidenceRepo;
+    @Autowired protected RainStationRepo rainStationRepo;
+    @Autowired protected RainSampleRepo rainSampleRepo;
+    @Autowired protected RainEventRepo rainEventRepo;
+    @Autowired protected RainRiskWindowRepo rainRiskWindowRepo;
+    @Autowired protected SubbasinSeriesRepo subbasinSeriesRepo;
+    @Autowired protected WeightSetRepo weightSetRepo;
+    @Autowired protected RainLedgerRepo rainLedgerRepo;
 
     protected ScenarioBuilder scenario;
 
     @BeforeEach
     void cleanDb() {
+        rainLedgerRepo.deleteAll();
+        subbasinSeriesRepo.deleteAll();
+        rainRiskWindowRepo.deleteAll();
+        rainEventRepo.deleteAll();
+        rainSampleRepo.deleteAll();
+        weightSetRepo.deleteAll();
+        rainStationRepo.deleteAll();
         diffRepo.deleteAll();
         runRepo.deleteAll();
         evidenceRepo.deleteAll();
